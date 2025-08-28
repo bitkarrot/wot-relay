@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	payments "github.com/bitkarrot/khatru-payments"
 	"github.com/fiatjaf/eventstore"
 	"github.com/fiatjaf/eventstore/badger"
 	"github.com/fiatjaf/khatru"
@@ -25,7 +26,8 @@ import (
 )
 
 var (
-	version string
+	version       string
+	paymentSystem *payments.System
 )
 
 type Config struct {
@@ -110,6 +112,16 @@ func main() {
 	pool = nostr.NewSimplePool(ctx)
 	config = LoadConfig()
 
+	// Initialize payment system from environment variables
+	var err error
+	paymentSystem, err = payments.NewFromEnv()
+	if err != nil {
+		log.Printf("⚠️ Payment system initialization failed: %v", err)
+		log.Println("💡 Relay will run without payment system")
+	} else {
+		log.Println("💰 Payment system initialized successfully")
+	}
+
 	relay.Info.Name = config.RelayName
 	relay.Info.PubKey = config.RelayPubkey
 	relay.Info.Icon = config.RelayIcon
@@ -164,6 +176,10 @@ func main() {
 
 		if !trusted {
 			atomic.AddUint64(&rejectedEvents, 1)
+			// For non-WoT users, check payment system if available
+			if paymentSystem != nil {
+				return paymentSystem.RejectEventHandler(ctx, event)
+			}
 			return true, "not in web of trust"
 		}
 		if event.Kind == nostr.KindEncryptedDirectMessage {
@@ -205,6 +221,12 @@ func main() {
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
+	// Register payment system handlers if available
+	if paymentSystem != nil {
+		paymentSystem.RegisterHandlers(mux)
+		log.Println("💰 Payment system endpoints registered")
+	}
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
 		data := struct {
@@ -229,7 +251,7 @@ func main() {
 	log.Println("   http://localhost:3334/debug/pprof/ (CPU/memory profiling)")
 	log.Println("   http://localhost:3334/debug/stats (application stats)")
 	log.Println("   http://localhost:3334/debug/goroutines (goroutine info)")
-	err := http.ListenAndServe(":3334", relay)
+	err = http.ListenAndServe(":3334", relay)
 	if err != nil {
 		log.Fatal(err)
 	}

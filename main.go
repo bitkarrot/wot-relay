@@ -175,11 +175,18 @@ func main() {
 		}
 
 		if !trusted {
-			atomic.AddUint64(&rejectedEvents, 1)
-			// For non-WoT users, check payment system if available
+			// For non-WoT users, check payment system first if available
 			if paymentSystem != nil {
+				// Check if user has paid access
+				if paymentSystem.HasAccess(event.PubKey) {
+					return false, "" // Allow paid users
+				}
+				// If no paid access, return payment invoice
+				atomic.AddUint64(&rejectedEvents, 1)
 				return paymentSystem.RejectEventHandler(ctx, event)
 			}
+			// No payment system available, reject with WoT message
+			atomic.AddUint64(&rejectedEvents, 1)
 			return true, "not in web of trust"
 		}
 		if event.Kind == nostr.KindEncryptedDirectMessage {

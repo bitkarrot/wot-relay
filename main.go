@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -49,6 +50,39 @@ type Config struct {
 	MaxOneHopNetwork int
 }
 
+// Flag represents a flag against an event
+type Flag struct {
+	ID           string    `json:"id"`
+	FlaggerPubkey string   `json:"flagger_pubkey"`
+	TargetEventID string   `json:"target_event_id"`
+	TargetAuthor  string   `json:"target_author"`
+	Category      string   `json:"category"`
+	Reason        string   `json:"reason"`
+	Timestamp     time.Time `json:"timestamp"`
+	EventKind     int       `json:"event_kind"`
+}
+
+// FlagSummary represents aggregated flags for an event
+type FlagSummary struct {
+	EventID      string            `json:"event_id"`
+	TotalFlags   int               `json:"total_flags"`
+	Categories   map[string]int    `json:"categories"`
+	Flaggers     []string          `json:"flaggers"`
+	FirstFlag    time.Time         `json:"first_flag"`
+	LastFlag     time.Time         `json:"last_flag"`
+	Status       string            `json:"status"` // "active", "removed", "under_review"
+}
+
+// FlaggingConfig holds configuration for the flagging system
+type FlaggingConfig struct {
+	Threshold        int           `json:"threshold"`
+	CooldownHours    int           `json:"cooldown_hours"`
+	AdminOverride    bool          `json:"admin_override"`
+	Categories       []string      `json:"categories"`
+	AdminPubkeys     []string      `json:"admin_pubkeys"`
+	TargetKinds      []int         `json:"target_kinds"`
+}
+
 var pool *nostr.SimplePool
 var wdb nostr.RelayStore
 var relays []string
@@ -81,6 +115,16 @@ var (
 	trustNetworkMutex sync.RWMutex
 	oneHopMutex       sync.RWMutex
 	followerMutex     sync.RWMutex
+)
+
+// Flagging system global variables
+var (
+	flaggingConfig    FlaggingConfig
+	flagDatabase      = make(map[string][]Flag)        // eventID -> []Flag
+	flagSummaries     = make(map[string]*FlagSummary)  // eventID -> FlagSummary
+	userFlagCooldowns = make(map[string]time.Time)     // pubkey -> last flag time
+	flagMutex         sync.RWMutex
+	globalRelay       *khatru.Relay // Global relay reference for HTTP handlers
 )
 
 func main() {
@@ -195,6 +239,11 @@ func main() {
 	go monitorMemoryUsage() // Add memory monitoring
 	go monitorPerformance() // Add performance monitoring
 
+	// Initialize flagging system
+	initFlaggingSystem()
+	globalRelay = relay // Store global reference
+	handleFlaggingInRelay(relay)
+
 	mux := relay.Router()
 	static := http.FileServer(http.Dir(config.StaticPath))
 
@@ -204,6 +253,10 @@ func main() {
 	// Add debug endpoints
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
+
+	// Add flagging endpoints
+	mux.HandleFunc("GET /debug/flags", flagStatsHandler)
+	mux.HandleFunc("POST /admin/flag-action", adminFlagActionHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
@@ -934,4 +987,394 @@ func debugGoroutinesHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write(buf[:stackSize])
+}
+
+// Flagging system functions
+
+// Initialize flagging system
+func initFlaggingSystem() {
+	flaggingConfig = FlaggingConfig{
+		Threshold:     getEnvInt("FLAG_THRESHOLD", 5),
+		CooldownHours: getEnvInt("FLAG_COOLDOWN_HOURS", 24),
+		AdminOverride: getEnvBool("FLAG_ADMIN_OVERRIDE", true),
+		Categories:    strings.Split(getEnvString("FLAG_CATEGORIES", "fraud,spam,scam,duplicate,inappropriate,impersonation"), ","),
+		AdminPubkeys:  strings.Split(getEnvString("FLAG_ADMIN_PUBKEYS", ""), ","),
+		TargetKinds:   []int{30402, 31900, 1}, // Directory entries, other target kinds, and text notes
+	}
+
+	log.Printf("🚩 Flagging system initialized with threshold: %d", flaggingConfig.Threshold)
+}
+
+// Process flag event (Kind 1984)
+func processFlagEvent(ctx context.Context, event *nostr.Event, relay *khatru.Relay) error {
+	flagMutex.Lock()
+	defer flagMutex.Unlock()
+
+	// Validate flagger is in WoT
+	trustNetworkMutex.RLock()
+	trusted := trustNetworkMap[event.PubKey]
+	trustNetworkMutex.RUnlock()
+
+	if !trusted {
+		return fmt.Errorf("flagger not in web of trust")
+	}
+
+	// Check cooldown
+	if lastFlag, exists := userFlagCooldowns[event.PubKey]; exists {
+		cooldownDuration := time.Duration(flaggingConfig.CooldownHours) * time.Hour
+		if time.Since(lastFlag) < cooldownDuration {
+			return fmt.Errorf("flagger in cooldown period")
+		}
+	}
+
+	// Parse flag event
+	flag, err := parseFlagEvent(event)
+	if err != nil {
+		return fmt.Errorf("invalid flag event: %v", err)
+	}
+
+	// Check if target event exists and is flaggable
+	if !isEventFlaggable(flag.EventKind) {
+		return fmt.Errorf("event kind %d not flaggable", flag.EventKind)
+	}
+
+	// Check for duplicate flag from same user
+	if isDuplicateFlag(flag.TargetEventID, flag.FlaggerPubkey) {
+		return fmt.Errorf("user already flagged this event")
+	}
+
+	// Store flag
+	flagDatabase[flag.TargetEventID] = append(flagDatabase[flag.TargetEventID], *flag)
+	userFlagCooldowns[event.PubKey] = time.Now()
+
+	// Update flag summary
+	updateFlagSummary(flag)
+
+	// Check if threshold reached
+	summary := flagSummaries[flag.TargetEventID]
+	if summary.TotalFlags >= flaggingConfig.Threshold {
+		log.Printf("🚩 Flag threshold reached for event %s (%d flags)", flag.TargetEventID, summary.TotalFlags)
+		
+		// Auto-remove the flagged event
+		err := autoRemoveEvent(ctx, flag.TargetEventID, relay)
+		if err != nil {
+			log.Printf("❌ Failed to auto-remove event %s: %v", flag.TargetEventID, err)
+		} else {
+			log.Printf("✅ Auto-removed flagged event %s", flag.TargetEventID)
+			summary.Status = "removed"
+		}
+	}
+
+	// Store flag event itself
+	wdb.Publish(ctx, *event)
+
+	log.Printf("🚩 Flag recorded: %s flagged %s for %s", flag.FlaggerPubkey[:8], flag.TargetEventID[:8], flag.Category)
+	return nil
+}
+
+// Parse flag event into Flag struct
+func parseFlagEvent(event *nostr.Event) (*Flag, error) {
+	flag := &Flag{
+		ID:            event.ID,
+		FlaggerPubkey: event.PubKey,
+		Reason:        event.Content,
+		Timestamp:     time.Unix(int64(event.CreatedAt), 0),
+	}
+
+	// Parse tags
+	for _, tag := range event.Tags {
+		if len(tag) < 2 {
+			continue
+		}
+
+		switch tag[0] {
+		case "e":
+			flag.TargetEventID = tag[1]
+		case "p":
+			flag.TargetAuthor = tag[1]
+		case "report":
+			flag.Category = tag[1]
+		case "k":
+			if kind, err := strconv.Atoi(tag[1]); err == nil {
+				flag.EventKind = kind
+			}
+		}
+	}
+
+	// Validate required fields
+	if flag.TargetEventID == "" {
+		return nil, fmt.Errorf("missing target event ID")
+	}
+	if flag.Category == "" {
+		return nil, fmt.Errorf("missing report category")
+	}
+	if !isValidCategory(flag.Category) {
+		return nil, fmt.Errorf("invalid category: %s", flag.Category)
+	}
+
+	return flag, nil
+}
+
+// Check if event kind is flaggable
+func isEventFlaggable(kind int) bool {
+	for _, targetKind := range flaggingConfig.TargetKinds {
+		if kind == targetKind {
+			return true
+		}
+	}
+	return false
+}
+
+// Check if category is valid
+func isValidCategory(category string) bool {
+	for _, validCategory := range flaggingConfig.Categories {
+		if category == validCategory {
+			return true
+		}
+	}
+	return false
+}
+
+// Check for duplicate flag
+func isDuplicateFlag(eventID, flaggerPubkey string) bool {
+	flags, exists := flagDatabase[eventID]
+	if !exists {
+		return false
+	}
+
+	for _, flag := range flags {
+		if flag.FlaggerPubkey == flaggerPubkey {
+			return true
+		}
+	}
+	return false
+}
+
+// Update flag summary
+func updateFlagSummary(flag *Flag) {
+	summary, exists := flagSummaries[flag.TargetEventID]
+	if !exists {
+		summary = &FlagSummary{
+			EventID:    flag.TargetEventID,
+			Categories: make(map[string]int),
+			Flaggers:   []string{},
+			FirstFlag:  flag.Timestamp,
+			Status:     "active",
+		}
+		flagSummaries[flag.TargetEventID] = summary
+	}
+
+	summary.TotalFlags++
+	summary.Categories[flag.Category]++
+	summary.Flaggers = append(summary.Flaggers, flag.FlaggerPubkey)
+	summary.LastFlag = flag.Timestamp
+}
+
+// Auto-remove flagged event
+func autoRemoveEvent(ctx context.Context, eventID string, relay *khatru.Relay) error {
+	// Query for the event to be removed
+	filter := nostr.Filter{
+		IDs: []string{eventID},
+	}
+
+	ch, err := wdb.QueryEvents(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("failed to query event: %v", err)
+	}
+
+	var eventToDelete *nostr.Event
+	for event := range ch {
+		eventToDelete = event
+		break
+	}
+
+	if eventToDelete == nil {
+		return fmt.Errorf("event not found: %s", eventID)
+	}
+
+	// Delete the event using existing relay delete functionality
+	for _, del := range relay.DeleteEvent {
+		if err := del(ctx, eventToDelete); err != nil {
+			return fmt.Errorf("failed to delete event: %v", err)
+		}
+	}
+
+	// Create deletion event (Kind 5) for transparency
+	deletionEvent := &nostr.Event{
+		Kind:      nostr.KindDeletion,
+		PubKey:    config.RelayPubkey,
+		CreatedAt: nostr.Now(),
+		Content:   fmt.Sprintf("Event removed due to community flags (threshold: %d)", flaggingConfig.Threshold),
+		Tags: nostr.Tags{
+			{"e", eventID},
+			{"k", strconv.Itoa(eventToDelete.Kind)},
+			{"reason", "community_flagged"},
+		},
+	}
+
+	// Sign and publish deletion event
+	// Note: You'll need to implement event signing with relay's private key
+	wdb.Publish(ctx, *deletionEvent)
+
+	return nil
+}
+
+// Get flag summary for an event
+func getFlagSummary(eventID string) *FlagSummary {
+	flagMutex.RLock()
+	defer flagMutex.RUnlock()
+	
+	return flagSummaries[eventID]
+}
+
+// Get all flags for an event
+func getEventFlags(eventID string) []Flag {
+	flagMutex.RLock()
+	defer flagMutex.RUnlock()
+	
+	return flagDatabase[eventID]
+}
+
+// Admin functions
+func isAdmin(pubkey string) bool {
+	for _, adminPubkey := range flaggingConfig.AdminPubkeys {
+		if pubkey == adminPubkey {
+			return true
+		}
+	}
+	return false
+}
+
+// Manual review and override
+func adminOverrideFlag(adminPubkey, eventID, action string, relay *khatru.Relay) error {
+	if !isAdmin(adminPubkey) {
+		return fmt.Errorf("not authorized")
+	}
+
+	flagMutex.Lock()
+	defer flagMutex.Unlock()
+
+	summary, exists := flagSummaries[eventID]
+	if !exists {
+		return fmt.Errorf("no flags found for event")
+	}
+
+	switch action {
+	case "approve_removal":
+		summary.Status = "removed"
+		// Delete the event
+		ctx := context.Background()
+		return autoRemoveEvent(ctx, eventID, relay)
+	case "reject_flags":
+		summary.Status = "flags_rejected"
+		// Clear flags but keep record
+		delete(flagDatabase, eventID)
+	case "under_review":
+		summary.Status = "under_review"
+	}
+
+	log.Printf("🔧 Admin %s performed %s on event %s", adminPubkey[:8], action, eventID[:8])
+	return nil
+}
+
+// HTTP handlers for flag management
+func flagStatsHandler(w http.ResponseWriter, r *http.Request) {
+	flagMutex.RLock()
+	defer flagMutex.RUnlock()
+
+	stats := struct {
+		TotalFlaggedEvents int                        `json:"total_flagged_events"`
+		TotalFlags         int                        `json:"total_flags"`
+		RemovedEvents      int                        `json:"removed_events"`
+		FlagSummaries      map[string]*FlagSummary    `json:"flag_summaries"`
+		Config             FlaggingConfig             `json:"config"`
+	}{
+		TotalFlaggedEvents: len(flagSummaries),
+		FlagSummaries:      flagSummaries,
+		Config:             flaggingConfig,
+	}
+
+	// Count total flags and removed events
+	for _, summary := range flagSummaries {
+		stats.TotalFlags += summary.TotalFlags
+		if summary.Status == "removed" {
+			stats.RemovedEvents++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+// HTTP handler for admin flag actions
+func adminFlagActionHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		AdminPubkey string `json:"admin_pubkey"`
+		EventID     string `json:"event_id"`
+		Action      string `json:"action"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	err := adminOverrideFlag(req.AdminPubkey, req.EventID, req.Action, globalRelay)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// Integration point: Add this to your main relay event processing loop
+func handleFlaggingInRelay(relay *khatru.Relay) {
+	// Add flag event handler to existing event processing
+	relay.StoreEvent = append(relay.StoreEvent, func(ctx context.Context, event *nostr.Event) error {
+		// Process flag events (Kind 1984)
+		if event.Kind == 1984 {
+			err := processFlagEvent(ctx, event, relay)
+			if err != nil {
+				log.Printf("❌ Flag processing error: %v", err)
+				return err
+			}
+			return nil
+		}
+		
+		// Continue with normal event processing
+		return nil
+	})
+
+	log.Println("🚩 Flagging system integrated with relay")
+}
+
+// Utility functions for environment variables
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		return strings.ToLower(value) == "true"
+	}
+	return defaultValue
+}
+
+func getEnvString(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }

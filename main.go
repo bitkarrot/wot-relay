@@ -282,6 +282,8 @@ func main() {
 	log.Println("   http://localhost:3334/debug/pprof/ (CPU/memory profiling)")
 	log.Println("   http://localhost:3334/debug/stats (application stats)")
 	log.Println("   http://localhost:3334/debug/goroutines (goroutine info)")
+	log.Println("   http://localhost:3334/debug/flags (flagging system stats)")
+	
 	err := http.ListenAndServe(":3334", relay)
 	if err != nil {
 		log.Fatal(err)

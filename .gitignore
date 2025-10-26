@@ -3,3 +3,4 @@ db/
 wot-relay
 *.txt
 .env.test
+*~
